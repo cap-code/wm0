@@ -9,6 +9,7 @@ struct Client {
   xcb_window_t frame;
   xcb_window_t titlebar;
   xcb_window_t window;
+  xcb_gcontext_t titlebar_gc;
   int x, y;
   int width, height;
 };
@@ -47,6 +48,26 @@ static const int MIN_WIDTH = 100;
 static const int MIN_HEIGHT = 80;
 static const int TITLE_HEIGHT = 24;
 
+static const uint32_t COLOR_ACTIVE = 0x005577FF;
+static const uint32_t COLOR_INACTIVE = 0x333333FF;
+
+
+void draw_titlebar(
+  xcb_connection_t* conn,
+  xcb_window_t win,
+  xcb_gcontext_t gc,
+  uint32_t color,
+  int width
+){
+  uint32_t vals[] = {color};
+
+  xcb_change_gc(conn,gc,XCB_GC_FOREGROUND,vals);
+
+  xcb_rectangle_t rect = {0,0,static_cast<uint16_t>(width),TITLE_HEIGHT};
+
+  xcb_poly_fill_rectangle(conn,win,gc,1,&rect);
+
+}
 int main() {
   XConnection conn;
 
@@ -63,6 +84,7 @@ int main() {
   std::unordered_map<xcb_window_t, Client> clients;
   DragState drag;
   ResizeState resize;
+  xcb_window_t focused_window = XCB_NONE;
 
   std::cout << "Screen size: " << screen->width_in_pixels << "x"
             << screen->height_in_pixels << "\n"
@@ -196,8 +218,8 @@ int main() {
                         x, y, width, height, 10, XCB_WINDOW_CLASS_INPUT_OUTPUT,
                         screen->root_visual, XCB_CW_EVENT_MASK, frame_events);
 
-      uint32_t titlebar_events[] = {XCB_EVENT_MASK_BUTTON_PRESS |
-                                    XCB_EVENT_MASK_BUTTON_RELEASE | XCB_EVENT_MASK_POINTER_MOTION};
+      uint32_t titlebar_events[] = {XCB_EVENT_MASK_BUTTON_PRESS | XCB_EVENT_MASK_EXPOSURE
+                                    | XCB_EVENT_MASK_BUTTON_RELEASE | XCB_EVENT_MASK_POINTER_MOTION};
 
       xcb_create_window(conn.get(), XCB_COPY_FROM_PARENT, titlebar, frame, 0, 0,
                         width, TITLE_HEIGHT, 0, XCB_WINDOW_CLASS_INPUT_OUTPUT,
@@ -211,12 +233,16 @@ int main() {
                           XCB_EVENT_MASK_BUTTON_RELEASE,
                       XCB_GRAB_MODE_ASYNC, XCB_GRAB_MODE_ASYNC, XCB_NONE,
                       XCB_NONE, XCB_BUTTON_INDEX_1, XCB_MOD_MASK_ANY);
+      
+      xcb_gcontext_t titlebar_gc = xcb_generate_id(conn.get());
+      uint32_t titlebar_gc_vals[] = {COLOR_INACTIVE};
+      xcb_create_gc(conn.get(),titlebar_gc,titlebar,XCB_GC_FOREGROUND,titlebar_gc_vals);
 
       xcb_map_window(conn.get(), titlebar);
       xcb_map_window(conn.get(), frame);
       xcb_map_window(conn.get(), e->window);
 
-      clients[e->window] = {frame, titlebar, e->window, x, y, width, height};
+      clients[e->window] = {frame, titlebar, e->window, titlebar_gc, x, y, width, height};
       break;
     }
 
@@ -270,6 +296,7 @@ int main() {
 
             free(geom);
           }
+          focused_window = client.window;
 
           xcb_set_input_focus(conn.get(), XCB_INPUT_FOCUS_POINTER_ROOT,
                               client.window, XCB_CURRENT_TIME);
@@ -281,6 +308,9 @@ int main() {
           break;
         }
       }
+      for(auto& [window,client]:clients){
+        draw_titlebar(conn.get(),client.titlebar,client.titlebar_gc,(client.window == focused_window ? COLOR_ACTIVE: COLOR_INACTIVE),client.width);
+      }
       break;
     }
 
@@ -291,6 +321,7 @@ int main() {
 
       if (it != clients.end()) {
         xcb_destroy_window(conn.get(), it->second.frame);
+        xcb_free_gc(conn.get(),it->second.titlebar_gc);
         clients.erase(it);
       }
       break;
@@ -349,6 +380,8 @@ int main() {
             client.y = y;
             client.width = w;
             client.height = h;
+
+            xcb_configure_window(conn.get(),client.titlebar,XCB_CONFIG_WINDOW_WIDTH,&w);
           }
         }
       }
@@ -375,6 +408,21 @@ int main() {
       drag.frame = XCB_NONE;
       resize.active = false;
       resize.frame = XCB_NONE;
+      break;
+    }
+
+    case XCB_EXPOSE:{
+      auto* e = reinterpret_cast<xcb_expose_event_t*>(event);
+
+      if(e->count != 0) break;
+
+      for(auto& [window,client]:clients){
+        if(e->window == client.titlebar ){
+          uint32_t color = (focused_window == client.window ? COLOR_ACTIVE : COLOR_INACTIVE);
+          draw_titlebar(conn.get(),client.titlebar,client.titlebar_gc,color,client.width);
+          break;
+        }
+      }
       break;
     }
 
