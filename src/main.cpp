@@ -1,9 +1,11 @@
 #include "xconnection.h"
+#include <cstddef>
 #include <cstdint>
 #include <iostream>
 #include <unordered_map>
 #include <xcb/xcb.h>
 #include <xcb/xproto.h>
+#include <xcb/xcb_cursor.h>
 
 struct Client {
   xcb_window_t frame;
@@ -12,6 +14,7 @@ struct Client {
   xcb_gcontext_t titlebar_gc;
   int x, y;
   int width, height;
+  std::string title;
 };
 
 struct DragState {
@@ -50,23 +53,63 @@ static const int TITLE_HEIGHT = 24;
 
 static const uint32_t COLOR_ACTIVE = 0x005577FF;
 static const uint32_t COLOR_INACTIVE = 0x333333FF;
+static const uint32_t COLOR_TEXT = 0xFFFFFFFF;
 
+std::string get_window_title(xcb_connection_t* conn,xcb_window_t win){
+
+  xcb_intern_atom_cookie_t name_cookie = xcb_intern_atom(conn,0,12,"_NET_WM_NAME");
+
+  xcb_intern_atom_reply_t* name_reply = xcb_intern_atom_reply(conn,name_cookie,nullptr);
+
+  if(!name_reply) {
+    name_cookie = xcb_intern_atom(conn,0,7,"WM_NAME");
+    name_reply = xcb_intern_atom_reply(conn,name_cookie,nullptr);
+    if (!name_reply) return "";
+  }
+
+  xcb_atom_t name_atom = name_reply->atom;
+  free(name_reply);
+
+  xcb_get_property_cookie_t prop_cookie = xcb_get_property(conn,0,win,name_atom,XCB_GET_PROPERTY_TYPE_ANY,0,1024);
+  xcb_get_property_reply_t* prop = xcb_get_property_reply(conn,prop_cookie,nullptr);
+
+  if(!prop) return "";
+
+
+  std::string title;
+
+  if(xcb_get_property_value_length(prop) > 0){
+    title.assign(
+      static_cast<char*>(xcb_get_property_value(prop)),
+      xcb_get_property_value_length(prop)
+    );
+  }
+  
+  free(prop);
+
+  std::cout<<"window title: "<<title<<"\n"<<std::endl;
+  return title;
+}
 
 void draw_titlebar(
   xcb_connection_t* conn,
   xcb_window_t win,
   xcb_gcontext_t gc,
   uint32_t color,
+  const std::string& title,
   int width
 ){
-  uint32_t vals[] = {color};
+  uint32_t vals[] = {color,COLOR_TEXT};
 
-  xcb_change_gc(conn,gc,XCB_GC_FOREGROUND,vals);
+  xcb_change_gc(conn,gc,XCB_GC_FOREGROUND | XCB_GC_BACKGROUND,vals);
 
   xcb_rectangle_t rect = {0,0,static_cast<uint16_t>(width),TITLE_HEIGHT};
 
   xcb_poly_fill_rectangle(conn,win,gc,1,&rect);
 
+  if(!title.empty()){
+    xcb_image_text_8(conn,title.size(),win,gc,8,16,title.c_str());
+  }
 }
 int main() {
   XConnection conn;
@@ -106,6 +149,16 @@ int main() {
     return 1;
   }
 
+  xcb_cursor_context_t* cursor_ctx;
+  xcb_cursor_context_new(conn.get(),screen,&cursor_ctx);
+  
+  xcb_cursor_t normal_cursor = xcb_cursor_load_cursor(cursor_ctx,"left_ptr");
+  uint32_t cursor_vals[] = {normal_cursor};
+
+  xcb_change_window_attributes(conn.get(),screen->root,XCB_CW_CURSOR,cursor_vals);
+  xcb_cursor_context_free(cursor_ctx);
+
+  
   xcb_flush(conn.get());
 
   std::cout << "WM running ...\n" << std::endl;
@@ -234,6 +287,10 @@ int main() {
                       XCB_GRAB_MODE_ASYNC, XCB_GRAB_MODE_ASYNC, XCB_NONE,
                       XCB_NONE, XCB_BUTTON_INDEX_1, XCB_MOD_MASK_ANY);
       
+      uint32_t titlebar_client_events[] = {XCB_EVENT_MASK_PROPERTY_CHANGE };
+      
+      xcb_change_window_attributes(conn.get(),e->window,XCB_CW_EVENT_MASK,titlebar_client_events);
+      
       xcb_gcontext_t titlebar_gc = xcb_generate_id(conn.get());
       uint32_t titlebar_gc_vals[] = {COLOR_INACTIVE};
       xcb_create_gc(conn.get(),titlebar_gc,titlebar,XCB_GC_FOREGROUND,titlebar_gc_vals);
@@ -241,8 +298,10 @@ int main() {
       xcb_map_window(conn.get(), titlebar);
       xcb_map_window(conn.get(), frame);
       xcb_map_window(conn.get(), e->window);
-
-      clients[e->window] = {frame, titlebar, e->window, titlebar_gc, x, y, width, height};
+      
+      std::string title = get_window_title(conn.get(),e->window);
+      if(title.empty()) title = "Untitled";
+      clients[e->window] = {frame, titlebar, e->window, titlebar_gc, x, y, width, height, title};
       break;
     }
 
@@ -309,7 +368,7 @@ int main() {
         }
       }
       for(auto& [window,client]:clients){
-        draw_titlebar(conn.get(),client.titlebar,client.titlebar_gc,(client.window == focused_window ? COLOR_ACTIVE: COLOR_INACTIVE),client.width);
+        draw_titlebar(conn.get(),client.titlebar,client.titlebar_gc,(client.window == focused_window ? COLOR_ACTIVE: COLOR_INACTIVE),client.title,client.width);
       }
       break;
     }
@@ -419,13 +478,52 @@ int main() {
       for(auto& [window,client]:clients){
         if(e->window == client.titlebar ){
           uint32_t color = (focused_window == client.window ? COLOR_ACTIVE : COLOR_INACTIVE);
-          draw_titlebar(conn.get(),client.titlebar,client.titlebar_gc,color,client.width);
+          draw_titlebar(conn.get(),client.titlebar,client.titlebar_gc,color,client.title,client.width);
           break;
         }
       }
       break;
     }
+    case XCB_PROPERTY_NOTIFY: {
+      auto* e = reinterpret_cast<xcb_property_notify_event_t*>(event);
 
+      auto it = clients.find(e->window);
+
+      if(it == clients.end()) break;
+
+      xcb_intern_atom_cookie_t name_cookie = xcb_intern_atom(conn.get(), 1, 12, "_NET_WM_NAME");
+      xcb_intern_atom_reply_t* name_reply = xcb_intern_atom_reply(conn.get(), name_cookie, nullptr);
+  
+      bool is_title_change = false;
+      if (name_reply) {
+          is_title_change = (e->atom == name_reply->atom);
+          free(name_reply);
+      }
+
+      if(!is_title_change){
+        name_cookie = xcb_intern_atom(conn.get(),1,7,"WN_NAME");
+        name_reply = xcb_intern_atom_reply(conn.get() , name_cookie, nullptr);
+        if(name_reply){
+          is_title_change = (e->atom == name_reply->atom);
+          free(name_reply);
+        }
+      }
+
+      if(is_title_change){
+        Client& client = it->second;
+        client.title = get_window_title(conn.get(),client.window);
+
+        if(client.title.empty()) client.title = "Untitled";
+
+        std::cout << "Title changed: " << client.title << "\n"<<std::endl;
+
+
+        uint32_t color = (focused_window == client.window ? COLOR_ACTIVE : COLOR_INACTIVE);
+        draw_titlebar(conn.get(),client.titlebar,client.titlebar_gc,color,client.title,client.width);
+      }
+
+      break;
+    }
     default:
       break;
     }
