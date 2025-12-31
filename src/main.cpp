@@ -6,6 +6,11 @@
 #include <xcb/xcb.h>
 #include <xcb/xproto.h>
 #include <xcb/xcb_cursor.h>
+#include <xcb/xcb_keysyms.h>
+#include <X11/keysym.h>
+#include <vector>
+#include <algorithm>
+
 
 struct Client {
   xcb_window_t frame;
@@ -125,6 +130,7 @@ int main() {
   xcb_screen_t *screen = it.data;
 
   std::unordered_map<xcb_window_t, Client> clients;
+  std::vector<xcb_window_t> client_order;
   DragState drag;
   ResizeState resize;
   xcb_window_t focused_window = XCB_NONE;
@@ -136,7 +142,9 @@ int main() {
   std::cout << "Root winow id: " << screen->root << "\n" << std::endl;
 
   uint32_t root_events[] = {XCB_EVENT_MASK_SUBSTRUCTURE_REDIRECT |
-                            XCB_EVENT_MASK_SUBSTRUCTURE_NOTIFY};
+                            XCB_EVENT_MASK_SUBSTRUCTURE_NOTIFY |
+                            XCB_EVENT_MASK_KEY_PRESS
+                          };
 
   xcb_void_cookie_t cookie = xcb_change_window_attributes_checked(
       conn.get(), screen->root, XCB_CW_EVENT_MASK, root_events);
@@ -158,6 +166,27 @@ int main() {
   xcb_change_window_attributes(conn.get(),screen->root,XCB_CW_CURSOR,cursor_vals);
   xcb_cursor_context_free(cursor_ctx);
 
+
+  xcb_key_symbols_t* keysyms = xcb_key_symbols_alloc(conn.get());
+
+  auto grab_key = [&](xcb_keysym_t sym , uint16_t mod){
+    xcb_keycode_t* codes = xcb_key_symbols_get_keycode(keysyms,sym);
+    for(int i=0; codes[i] != XCB_NO_SYMBOL;i++){
+      xcb_grab_key(
+      conn.get(),
+      1,
+      screen->root,
+      mod,
+      codes[i],
+      XCB_GRAB_MODE_ASYNC,
+      XCB_GRAB_MODE_ASYNC);
+    }
+    free(codes);
+  };
+
+
+  grab_key(XK_F4, XCB_MOD_MASK_1);
+  grab_key(XK_Tab, XCB_MOD_MASK_1);
   
   xcb_flush(conn.get());
 
@@ -173,6 +202,8 @@ int main() {
     switch (type) {
     case XCB_CONFIGURE_REQUEST: {
       auto *e = reinterpret_cast<xcb_configure_request_event_t *>(event);
+
+      std::cout << "Configure request received for window: " << e->window << "\n" << std::endl;
 
       auto it = clients.find(e->window);
       if (it == clients.end()) {
@@ -302,11 +333,14 @@ int main() {
       std::string title = get_window_title(conn.get(),e->window);
       if(title.empty()) title = "Untitled";
       clients[e->window] = {frame, titlebar, e->window, titlebar_gc, x, y, width, height, title};
+      client_order.push_back(e->window);
       break;
     }
 
     case XCB_BUTTON_PRESS: {
       auto *e = reinterpret_cast<xcb_button_press_event_t *>(event);
+
+      std::cout << "Button press event received for window: " << e->event << "\n" << std::endl;
 
       for (auto &[window, client] : clients) {
 
@@ -375,19 +409,40 @@ int main() {
 
     case XCB_DESTROY_NOTIFY: {
       auto *e = reinterpret_cast<xcb_destroy_notify_event_t *>(event);
-
+      std::cout << "Destroy notify received for window: " << e->window << "\n" << std::endl;
+      
       auto it = clients.find(e->window);
 
       if (it != clients.end()) {
+        std::cout << "Destroy notify it: " << it->second.frame << "\n" << std::endl;
+
+        if (drag.frame == it->second.frame) {
+          drag.active = false;
+          drag.frame = XCB_NONE;
+        }
+
+        if (resize.frame == it->second.frame) {
+          resize.active = false;
+          resize.frame = XCB_NONE;
+        }
         xcb_destroy_window(conn.get(), it->second.frame);
         xcb_free_gc(conn.get(),it->second.titlebar_gc);
         clients.erase(it);
+        if(focused_window == e->window){
+          focused_window = XCB_NONE;
+        }
+        auto it_order = std::find(client_order.begin(),client_order.end(),e->window);
+        if(it_order != client_order.end()){ 
+          client_order.erase(it_order);
+        }
       }
       break;
     }
 
     case XCB_MOTION_NOTIFY: {
       auto *e = reinterpret_cast<xcb_motion_notify_event_t *>(event);
+
+      std::cout << "Motion notify received for window: " << e->event << "\n" << std::endl;
 
       if (resize.active) {
         int dx = e->root_x - resize.start_root_x;
@@ -463,6 +518,8 @@ int main() {
     }
 
     case XCB_BUTTON_RELEASE: {
+      std::cout << "Button release event received for window: __ " << "\n" << std::endl;
+
       drag.active = false;
       drag.frame = XCB_NONE;
       resize.active = false;
@@ -472,6 +529,8 @@ int main() {
 
     case XCB_EXPOSE:{
       auto* e = reinterpret_cast<xcb_expose_event_t*>(event);
+
+      std::cout << "Expose event received for window: " << e->window << "\n" << std::endl;
 
       if(e->count != 0) break;
 
@@ -487,6 +546,8 @@ int main() {
     case XCB_PROPERTY_NOTIFY: {
       auto* e = reinterpret_cast<xcb_property_notify_event_t*>(event);
 
+      std::cout<<"Property notify event triggered: "<<e->window<<"\n"<<std::endl;
+
       auto it = clients.find(e->window);
 
       if(it == clients.end()) break;
@@ -501,7 +562,7 @@ int main() {
       }
 
       if(!is_title_change){
-        name_cookie = xcb_intern_atom(conn.get(),1,7,"WN_NAME");
+        name_cookie = xcb_intern_atom(conn.get(),1,7,"WM_NAME");
         name_reply = xcb_intern_atom_reply(conn.get() , name_cookie, nullptr);
         if(name_reply){
           is_title_change = (e->atom == name_reply->atom);
@@ -524,6 +585,66 @@ int main() {
 
       break;
     }
+    case XCB_KEY_PRESS: {
+      auto* e = reinterpret_cast<xcb_key_press_event_t*>(event);
+
+      std::cout << "Key press event received for window: " << e->event << "\n" << std::endl;
+
+      xcb_keysym_t sym = xcb_key_symbols_get_keysym(keysyms,e->detail,0);
+
+      std::cout << "Key press: keycode=" << (int)e->detail 
+      << " state=" << e->state 
+      << " keysym=" << sym << "\n" <<std::endl;
+
+      uint16_t clean_state = e->state & ~(XCB_MOD_MASK_LOCK | XCB_MOD_MASK_2 | XCB_MOD_MASK_3);
+
+      if((clean_state & XCB_MOD_MASK_1) && sym == XK_F4){
+        std::cout << "inside  alt + f4 key press \n"<<std::endl;
+        if(focused_window != XCB_NONE){
+          Client& c = clients[focused_window];
+          auto it_order = std::find(client_order.begin(),client_order.end(),focused_window);
+          if(it_order != client_order.end()){
+            client_order.erase(it_order);
+          }
+          if (drag.frame == c.frame) {
+            drag.active = false;
+            drag.frame = XCB_NONE;
+          }
+
+          if (resize.frame == c.frame) {
+            resize.active = false;
+            resize.frame = XCB_NONE;
+          }
+          xcb_free_gc(conn.get(),c.titlebar_gc);
+          xcb_destroy_window(conn.get(),c.frame);
+          clients.erase(clients.find(focused_window));
+          focused_window = XCB_NONE;
+        }
+      }
+      if((clean_state & XCB_MOD_MASK_1) && sym == XK_Tab){
+        std::cout << "inside alt + tab  key press \n"<<std::endl;
+        if(!client_order.empty()){
+          auto it = std::find(client_order.begin(),client_order.end(),focused_window);
+
+          if(it == client_order.end() || ++it == client_order.end()){
+            it = client_order.begin();
+        }
+        focused_window = *it; 
+        Client& c = clients[focused_window];
+
+        xcb_set_input_focus(conn.get(),XCB_INPUT_FOCUS_POINTER_ROOT,c.window,XCB_CURRENT_TIME);
+
+        uint32_t raise[] = {XCB_STACK_MODE_ABOVE};
+        xcb_configure_window(conn.get(),c.frame,XCB_CONFIG_WINDOW_STACK_MODE,raise);
+
+        for(auto& [window,client]:clients){
+          draw_titlebar(conn.get(),client.titlebar,client.titlebar_gc,(client.window == focused_window ? COLOR_ACTIVE: COLOR_INACTIVE),client.title,client.width);
+        }
+
+      }
+    }
+    break;
+  }
     default:
       break;
     }
